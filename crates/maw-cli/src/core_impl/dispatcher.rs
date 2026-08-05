@@ -478,7 +478,15 @@ fn dispatch_bun_dev_plugin(plugin: &LoadedPlugin, ctx: &InvokeContext) -> CliOut
         };
     };
 
+    let runner = std::env::var_os("MAW_BUN_DEV_RUNNER").map_or_else(
+        || {
+            let home = std::env::var_os("HOME").unwrap_or_else(|| "/home/axezii".into());
+            std::path::PathBuf::from(home).join(".maw/bin/maw-bun-dev-runner.ts")
+        },
+        std::path::PathBuf::from,
+    );
     let output = std::process::Command::new("bun")
+        .arg(runner)
         .arg(entry_path)
         .args(&ctx.args)
         .current_dir(&plugin.dir)

@@ -4,6 +4,7 @@ const DISPATCH_63: &[DispatcherEntry] = &[
 ];
 
 const ORACLE_USAGE: &str = "usage: maw oracle [ls|scan|search <query>|prune|register <name>|set-nickname <name> <nickname>|get-nickname <name>|about <name>]";
+const ORACLE_SCAN_EMPTY_WARNING: &str = "scan found 0 oracles; existing registry preserved";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
 struct OracleEntry {
@@ -117,21 +118,29 @@ fn oracle_parse_scan_options(argv: &[String], start: usize) -> Result<OracleList
 
 fn oracle_list(opts: &OracleListOptions, tmux: &mut OracleTmux) -> Result<String, String> {
     let registry = if opts.scan { oracle_scan_registry() } else { oracle_read_registry() };
-    if opts.scan { oracle_write_registry(&registry)?; }
+    let scan_warning = opts.scan && registry.oracles.is_empty();
+    if opts.scan { oracle_write_scanned_registry(&registry)?; }
     let awake = tmux.oracle_awake_oracles();
     let mut entries = oracle_enriched_entries(&registry, &awake);
     if opts.awake { entries.retain(|entry| awake.contains_key(&entry.name)); }
     if let Some(org) = &opts.org { entries.retain(|entry| entry.org == *org); }
     oracle_sort_entries(&mut entries, &awake, opts.sort_by.as_deref());
-    if opts.json { return oracle_json_list(&registry, &entries, &awake); }
-    Ok(oracle_text_list(&registry, &entries, &awake, opts.path))
+    if opts.json { return oracle_json_list(&registry, &entries, &awake, scan_warning.then_some(ORACLE_SCAN_EMPTY_WARNING)); }
+    let mut output = oracle_text_list(&registry, &entries, &awake, opts.path);
+    if scan_warning { output.insert_str(0, &format!("\n  \x1b[33m⚠\x1b[0m {ORACLE_SCAN_EMPTY_WARNING}\n\n")); }
+    Ok(output)
 }
 
 fn oracle_scan(opts: &OracleListOptions) -> Result<String, String> {
     if opts.stale { return Ok(oracle_stale(opts.json)); }
     let registry = oracle_scan_registry();
-    oracle_write_registry(&registry)?;
-    if opts.json { return serde_json::to_string_pretty(&registry).map(|value| format!("{value}\n")).map_err(|error| error.to_string()); }
+    let scan_warning = !oracle_write_scanned_registry(&registry)?;
+    if opts.json {
+        let mut value = serde_json::to_value(&registry).map_err(|error| error.to_string())?;
+        if scan_warning { value["warning"] = serde_json::Value::String(ORACLE_SCAN_EMPTY_WARNING.to_owned()); }
+        return serde_json::to_string_pretty(&value).map(|value| format!("{value}\n")).map_err(|error| error.to_string());
+    }
+    if scan_warning { return Ok(format!("\n  \x1b[33m⚠\x1b[0m {ORACLE_SCAN_EMPTY_WARNING}\n\n")); }
     Ok(format!("\n  \x1b[32m✓\x1b[0m {} oracles locally (cache written)\n\n", registry.oracles.len()))
 }
 
@@ -272,8 +281,18 @@ fn oracle_discover_one(name: &str, tmux: &mut OracleTmux) -> Option<OracleEntry>
 
 fn oracle_find_filesystem(name: &str) -> Option<OracleEntry> {
     let repos_root = ghq_root().join("github.com");
-    let Ok(orgs) = std::fs::read_dir(repos_root) else { return None; };
-    for org in orgs.flatten().filter(|entry| entry.path().is_dir()) { let org_name = org.file_name().to_string_lossy().to_string(); let path = org.path().join(format!("{name}-oracle")); if path.is_dir() { return oracle_entry_from_repo(&org_name, &path); } }
+    for suffix in ["", "-oracle"] {
+        let Ok(orgs) = std::fs::read_dir(&repos_root) else { return None; };
+        for org in orgs.flatten().filter(|entry| entry.path().is_dir()) {
+            let org_name = org.file_name().to_string_lossy().to_string();
+            let path = org.path().join(format!("{name}{suffix}"));
+            if path.is_dir() {
+                if let Some(entry) = oracle_entry_from_repo(&org_name, &path) {
+                    return Some(entry);
+                }
+            }
+        }
+    }
     None
 }
 
@@ -298,9 +317,11 @@ fn oracle_format_row(entry: &OracleEntry, awake: bool, show_path: bool) -> Strin
     format!("  {source}  {}  {}  {psi}{nick}{path}\n", entry.name, entry.org)
 }
 
-fn oracle_json_list(registry: &OracleRegistry, entries: &[OracleEntry], awake: &BTreeMap<String, String>) -> Result<String, String> {
+fn oracle_json_list(registry: &OracleRegistry, entries: &[OracleEntry], awake: &BTreeMap<String, String>, warning: Option<&str>) -> Result<String, String> {
     let oracles = entries.iter().map(|entry| { let mut value = serde_json::to_value(entry).unwrap_or_default(); value["awake"] = serde_json::Value::Bool(awake.contains_key(&entry.name)); value["session"] = awake.get(&entry.name).map_or(serde_json::Value::Null, |s| serde_json::Value::String(s.clone())); value }).collect::<Vec<_>>();
-    Ok(format!("{}\n", serde_json::to_string_pretty(&serde_json::json!({"cache_scanned_at":registry.local_scanned_at,"total":entries.len(),"awake":entries.iter().filter(|entry| awake.contains_key(&entry.name)).count(),"oracles":oracles})).map_err(|error| error.to_string())?))
+    let mut value = serde_json::json!({"cache_scanned_at":registry.local_scanned_at,"total":entries.len(),"awake":entries.iter().filter(|entry| awake.contains_key(&entry.name)).count(),"oracles":oracles});
+    if let Some(warning) = warning { value["warning"] = serde_json::Value::String(warning.to_owned()); }
+    Ok(format!("{}\n", serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?))
 }
 
 fn oracle_sort_entries(entries: &mut [OracleEntry], awake: &BTreeMap<String, String>, sort_by: Option<&str>) {
@@ -318,6 +339,14 @@ fn oracle_write_registry(registry: &OracleRegistry) -> Result<(), String> {
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|error| error.to_string())?; }
     let text = serde_json::to_string_pretty(registry).map_err(|error| error.to_string())?;
     std::fs::write(path, format!("{text}\n")).map_err(|error| error.to_string())
+}
+
+fn oracle_write_scanned_registry(registry: &OracleRegistry) -> Result<bool, String> {
+    if registry.oracles.is_empty() {
+        return Ok(false);
+    }
+    oracle_write_registry(registry)?;
+    Ok(true)
 }
 
 fn oracle_retire_candidates(registry: &mut OracleRegistry, candidates: &[OracleEntry]) -> Result<(), String> {
@@ -383,6 +412,36 @@ mod oracle_tests {
     fn oracle_format_row_marks_fleet_and_psi() { let entry = OracleEntry { org: "org".to_owned(), repo: "neo-oracle".to_owned(), name: "neo".to_owned(), has_psi: true, has_fleet_config: true, ..OracleEntry::default() }; assert!(oracle_format_row(&entry, true, false).contains("fleet+awake")); }
 
     #[test]
+    fn empty_scan_warns_and_preserves_existing_registry() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarRestore::capture("HOME");
+        let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _cache = EnvVarRestore::capture("MAW_CACHE_DIR");
+        let _ghq = EnvVarRestore::capture("GHQ_ROOT");
+        let root = oracle_temp_root("empty-scan");
+        std::fs::create_dir_all(root.join("ghq/github.com")).expect("ghq");
+        std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
+        std::env::set_var("MAW_STATE_DIR", root.join("state"));
+        std::env::set_var("MAW_CACHE_DIR", root.join("cache"));
+        std::env::set_var("GHQ_ROOT", root.join("ghq"));
+        let existing = OracleRegistry {
+            schema: 1,
+            local_scanned_at: "before".to_owned(),
+            ghq_root: "old-root".to_owned(),
+            oracles: vec![OracleEntry { org: "acme".to_owned(), repo: "kept-oracle".to_owned(), name: "kept".to_owned(), ..OracleEntry::default() }],
+            retired: Vec::new(),
+        };
+        oracle_write_registry(&existing).expect("seed registry");
+
+        let output = oracle_scan(&OracleListOptions::default()).expect("empty scan");
+
+        assert!(output.contains(ORACLE_SCAN_EMPTY_WARNING));
+        assert_eq!(oracle_read_registry(), existing);
+    }
+
+    #[test]
     fn oracle_repo_scan_uses_declared_kind_before_suffix() {
         let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _home = EnvVarRestore::capture("HOME");
@@ -415,8 +474,8 @@ mod oracle_tests {
             session: NativeFleetSession {
                 name: "99-kind".to_owned(),
                 windows: vec![
-                    NativeFleetWindow { name: "foo".to_owned(), repo: "acme/foo".to_owned(), kind: Some(NativeRepoKind::Oracle) },
-                    NativeFleetWindow { name: "bar-oracle".to_owned(), repo: "acme/bar-oracle".to_owned(), kind: Some(NativeRepoKind::Project) },
+                    NativeFleetWindow { name: "foo".to_owned(), repo: "acme/foo".to_owned(), kind: Some(NativeRepoKind::Oracle), kind_source: None },
+                    NativeFleetWindow { name: "bar-oracle".to_owned(), repo: "acme/bar-oracle".to_owned(), kind: Some(NativeRepoKind::Project), kind_source: None },
                 ],
                 ..NativeFleetSession::default()
             },
@@ -425,5 +484,30 @@ mod oracle_tests {
         let entries = oracle_entries_from_fleet(&fleet);
 
         assert_eq!(entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), vec!["foo"]);
+    }
+
+    #[test]
+    fn oracle_filesystem_discovery_supports_bare_inferred_and_suffix_fallback() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarRestore::capture("HOME");
+        let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _ghq = EnvVarRestore::capture("GHQ_ROOT");
+        let root = oracle_temp_root("filesystem-discovery");
+        let bare = root.join("ghq/github.com/acme/bare");
+        let suffix = root.join("ghq/github.com/acme/legacy-oracle");
+        let plain = root.join("ghq/github.com/acme/plain");
+        std::fs::create_dir_all(bare.join("ψ")).expect("bare oracle");
+        std::fs::write(bare.join("CLAUDE.md"), "oracle\n").expect("claude");
+        std::fs::create_dir_all(&suffix).expect("suffix oracle");
+        std::fs::create_dir_all(&plain).expect("plain repo");
+        std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
+        std::env::set_var("MAW_STATE_DIR", root.join("state"));
+        std::env::set_var("GHQ_ROOT", root.join("ghq/github.com"));
+
+        assert_eq!(oracle_find_filesystem("bare").map(|entry| entry.name), Some("bare".to_owned()));
+        assert_eq!(oracle_find_filesystem("legacy").map(|entry| entry.name), Some("legacy".to_owned()));
+        assert!(oracle_find_filesystem("plain").is_none());
     }
 }

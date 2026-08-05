@@ -35,6 +35,8 @@ struct NativeFleetWindow {
     repo: String,
     #[serde(default)]
     kind: Option<NativeRepoKind>,
+    #[serde(skip)]
+    kind_source: Option<NativeRepoClassificationSource>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -42,6 +44,39 @@ struct NativeFleetWindow {
 enum NativeRepoKind {
     Oracle,
     Project,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeRepoClassificationSource {
+    WindowKind,
+    RoleMarker,
+    PsiClaude,
+    LegacySuffix,
+}
+
+impl NativeRepoClassificationSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WindowKind => "window.kind",
+            Self::RoleMarker => ".maw/role",
+            Self::PsiClaude => "ψ/ + CLAUDE.md",
+            Self::LegacySuffix => "*-oracle",
+        }
+    }
+
+    fn confidence(self) -> &'static str {
+        match self {
+            Self::WindowKind | Self::RoleMarker => "declared",
+            Self::PsiClaude => "inferred",
+            Self::LegacySuffix => "legacy-guess",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeRepoClassification {
+    kind: NativeRepoKind,
+    source: NativeRepoClassificationSource,
 }
 
 #[allow(dead_code)]
@@ -507,37 +542,52 @@ fn current_xdg_env() -> MawXdgEnv {
 }
 
 fn ghq_root() -> std::path::PathBuf {
-    ghq_root_resolve(std::env::var_os("GHQ_ROOT"), ghq_root_from_git_config, std::env::var_os("HOME"))
+    ghq_root_resolve_with_commands(
+        std::env::var_os("GHQ_ROOT"),
+        |program, args| {
+            let output = std::process::Command::new(program).args(args).output().ok()?;
+            output.status.success().then(|| String::from_utf8(output.stdout).ok()).flatten()
+        },
+        std::env::var_os("HOME"),
+    )
 }
 
-// Resolution order mirrors ghq itself: $GHQ_ROOT env → `git config ghq.root` → ~/Code.
-// Without the git-config step, `maw wake <name>` only works in shells that happen to
-// export GHQ_ROOT (e.g. inside a direnv tree) while `ghq` resolves everywhere (#134).
+// Resolution order mirrors ghq itself: $GHQ_ROOT → git config ghq.root → `ghq root` → ~/ghq.
+// Keep this in one resolver: scope/find/locate/oracle and fleet must agree on the repo root.
+#[cfg(test)]
 fn ghq_root_resolve(
     env_root: Option<std::ffi::OsString>,
-    git_config_root: impl FnOnce() -> Option<String>,
+    mut git_config_root: impl FnMut() -> Option<String>,
+    home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    ghq_root_resolve_with_commands(
+        env_root,
+        |program, _args| if program == "git" { git_config_root() } else { None },
+        home,
+    )
+}
+
+fn ghq_root_resolve_with_commands(
+    env_root: Option<std::ffi::OsString>,
+    mut run_command: impl FnMut(&str, &[&str]) -> Option<String>,
     home: Option<std::ffi::OsString>,
 ) -> std::path::PathBuf {
     if let Some(value) = env_root {
         return ghq_root_strip_host(std::path::PathBuf::from(value));
     }
-    if let Some(value) = git_config_root() {
+    if let Some(value) = run_command("git", &["config", "--get", "ghq.root"]) {
         let expanded = ghq_root_expand_tilde(value.trim(), home.as_deref());
         if !expanded.as_os_str().is_empty() {
             return ghq_root_strip_host(expanded);
         }
     }
-    home.map_or_else(|| std::path::PathBuf::from(".").join("Code"), |home| std::path::PathBuf::from(home).join("Code"))
-}
-
-fn ghq_root_from_git_config() -> Option<String> {
-    let output = std::process::Command::new("git").args(["config", "--get", "ghq.root"]).output().ok()?;
-    if !output.status.success() {
-        return None;
+    if let Some(value) = run_command("ghq", &["root"]) {
+        let expanded = ghq_root_expand_tilde(value.trim(), home.as_deref());
+        if !expanded.as_os_str().is_empty() {
+            return ghq_root_strip_host(expanded);
+        }
     }
-    let value = String::from_utf8(output.stdout).ok()?;
-    let trimmed = value.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+    home.map_or_else(|| std::path::PathBuf::from(".").join("ghq"), |home| std::path::PathBuf::from(home).join("ghq"))
 }
 
 fn ghq_root_expand_tilde(value: &str, home: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
@@ -657,8 +707,11 @@ fn load_native_fleet() -> Vec<NativeFleetSession> {
 
 fn native_fleet_apply_role_markers(session: &mut NativeFleetSession) {
     for window in &mut session.windows {
-        if window.kind.is_none() {
-            window.kind = native_repo_marker_kind_for_slug(&window.repo);
+        if window.kind.is_some() {
+            window.kind_source = Some(NativeRepoClassificationSource::WindowKind);
+        } else if let Some(kind) = native_repo_marker_kind_for_slug(&window.repo) {
+            window.kind = Some(kind);
+            window.kind_source = Some(NativeRepoClassificationSource::RoleMarker);
         }
     }
 }
@@ -690,16 +743,40 @@ fn native_fleet_repo_path(repo: &str) -> Option<std::path::PathBuf> {
     Some(ghq_root().join("github.com").join(repo))
 }
 
-fn native_repo_kind_for_path(path: &std::path::Path) -> Option<NativeRepoKind> {
+fn native_repo_declared_kind_for_path(path: &std::path::Path) -> Option<NativeRepoClassification> {
     let slugs = native_repo_slugs_for_path(path);
-    for entry in fleet_load_entries() {
-        for window in &entry.session.windows {
-            if window.kind.is_some() && native_fleet_window_matches_slugs(window, &slugs) {
-                return window.kind;
+    let entries = fleet_load_entries();
+    // A marker may be projected into `window.kind` while loading fleet data.
+    // Resolve all declared JSON kinds first so an explicit project in a later
+    // fleet file cannot be shadowed by an earlier marker-derived oracle.
+    for source in [NativeRepoClassificationSource::WindowKind, NativeRepoClassificationSource::RoleMarker] {
+        for entry in &entries {
+            for window in &entry.session.windows {
+                let window_source = window.kind_source.unwrap_or(NativeRepoClassificationSource::WindowKind);
+                if window_source == source && window.kind.is_some() && native_fleet_window_matches_slugs(window, &slugs) {
+                    return Some(NativeRepoClassification {
+                        kind: window.kind?,
+                        source: window_source,
+                    });
+                }
             }
         }
     }
-    native_repo_marker_kind(path)
+    native_repo_marker_kind(path).map(|kind| NativeRepoClassification { kind, source: NativeRepoClassificationSource::RoleMarker })
+}
+
+fn native_repo_has_psi_and_claude(path: &std::path::Path) -> bool {
+    path.join("ψ").is_dir() && path.join("CLAUDE.md").is_file()
+}
+
+fn native_repo_classification_for_path(path: &std::path::Path, fallback_name: &str) -> Option<NativeRepoClassification> {
+    if let Some(classification) = native_repo_declared_kind_for_path(path) {
+        return Some(classification);
+    }
+    if native_repo_has_psi_and_claude(path) {
+        return Some(NativeRepoClassification { kind: NativeRepoKind::Oracle, source: NativeRepoClassificationSource::PsiClaude });
+    }
+    fallback_name.ends_with("-oracle").then_some(NativeRepoClassification { kind: NativeRepoKind::Oracle, source: NativeRepoClassificationSource::LegacySuffix })
 }
 
 fn native_repo_slugs_for_path(path: &std::path::Path) -> BTreeSet<String> {
@@ -738,19 +815,21 @@ fn native_fleet_window_matches_slugs(window: &NativeFleetWindow, slugs: &BTreeSe
 }
 
 fn native_repo_path_is_oracle(path: &std::path::Path, fallback_name: &str) -> bool {
-    match native_repo_kind_for_path(path) {
-        Some(NativeRepoKind::Oracle) => true,
-        Some(NativeRepoKind::Project) => false,
-        None => fallback_name.ends_with("-oracle"),
-    }
+    native_repo_classification_for_path(path, fallback_name).is_some_and(|classification| classification.kind == NativeRepoKind::Oracle)
 }
 
 fn native_fleet_window_is_oracle(window: &NativeFleetWindow) -> bool {
-    match window.kind {
-        Some(NativeRepoKind::Oracle) => true,
-        Some(NativeRepoKind::Project) => false,
-        None => window.name.ends_with("-oracle"),
+    // An explicit JSON kind is authoritative for this window. Marker-derived
+    // kinds must go through the central path classifier so a later explicit
+    // kind in another fleet file can still win globally.
+    if matches!(window.kind_source, Some(NativeRepoClassificationSource::WindowKind) | None) {
+        if let Some(kind) = window.kind {
+            return kind == NativeRepoKind::Oracle;
+        }
     }
+    native_fleet_repo_path(&window.repo)
+        .and_then(|path| native_repo_classification_for_path(&path, &window.name))
+        .map_or_else(|| window.kind == Some(NativeRepoKind::Oracle), |classification| classification.kind == NativeRepoKind::Oracle)
 }
 
 fn native_fleet_window_oracle_name(window: &NativeFleetWindow) -> Option<String> {
@@ -883,6 +962,28 @@ mod native_fleet_loader_tests {
             assert_eq!(windows[3].kind, Some(NativeRepoKind::Project));
         });
     }
+
+    #[test]
+    fn native_repo_declared_kind_prefers_explicit_window_over_earlier_role_marker() {
+        let root = fleet_loader_temp_root("kind-precedence");
+        let repo = root.join("ghq/github.com/acme/conflict");
+        fleet_loader_write(&repo.join(".maw/role"), "oracle\n");
+        fleet_loader_write(
+            &root.join("state/fleet/01-marker.json"),
+            r#"{"name":"01-marker","windows":[{"name":"conflict","repo":"acme/conflict"}]}"#,
+        );
+        fleet_loader_write(
+            &root.join("config/fleet/02-explicit.json"),
+            r#"{"name":"02-explicit","windows":[{"name":"conflict","repo":"acme/conflict","kind":"project"}]}"#,
+        );
+
+        fleet_loader_env(&root, || {
+            assert_eq!(
+                native_repo_declared_kind_for_path(&repo),
+                Some(NativeRepoClassification { kind: NativeRepoKind::Project, source: NativeRepoClassificationSource::WindowKind }),
+            );
+        });
+    }
 }
 
 fn flag_value(argv: &[String], flag: &str) -> Option<String> {
@@ -896,7 +997,7 @@ fn now_iso_utc() -> String {
 
 #[cfg(test)]
 mod scopefind_ghq_root_tests {
-    use super::{ghq_root_expand_tilde, ghq_root_resolve};
+    use super::{ghq_root_expand_tilde, ghq_root_resolve, ghq_root_resolve_with_commands};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -938,21 +1039,29 @@ mod scopefind_ghq_root_tests {
     }
 
     #[test]
-    fn empty_git_config_falls_back_to_home_code() {
+    fn empty_git_config_falls_back_to_home_ghq() {
         let root = ghq_root_resolve(None, || Some("   ".to_owned()), os("/Users/nat"));
-        assert_eq!(root, PathBuf::from("/Users/nat/Code"));
+        assert_eq!(root, PathBuf::from("/Users/nat/ghq"));
     }
 
     #[test]
-    fn no_sources_falls_back_to_home_code() {
+    fn no_sources_falls_back_to_home_ghq() {
         let root = ghq_root_resolve(None, || None, os("/Users/nat"));
-        assert_eq!(root, PathBuf::from("/Users/nat/Code"));
+        assert_eq!(root, PathBuf::from("/Users/nat/ghq"));
     }
 
     #[test]
-    fn no_home_falls_back_to_relative_code() {
+    fn no_home_falls_back_to_relative_ghq() {
         let root = ghq_root_resolve(None, || None, None);
-        assert_eq!(root, PathBuf::from(".").join("Code"));
+        assert_eq!(root, PathBuf::from(".").join("ghq"));
+    }
+
+    #[test]
+    fn ghq_command_is_used_before_home_fallback() {
+        let root = ghq_root_resolve_with_commands(None, |program, args| {
+            (program == "ghq" && args == ["root"]).then(|| "/opt/ghq\n".to_owned())
+        }, os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/opt/ghq"));
     }
 
     #[test]

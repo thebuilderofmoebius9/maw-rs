@@ -1,6 +1,8 @@
 {
   "name": "atlas",
   "repoPath": "__REPO_PLACEHOLDER__",
+  "repoSource": "*-oracle",
+  "repoConfidence": "legacy-guess",
   "hasPsi": true,
   "sessionName": "alpha",
   "windowCount": 2,

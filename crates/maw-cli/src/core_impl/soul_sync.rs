@@ -485,7 +485,7 @@ mod soulsync_tests {
     }
 
     fn soulsync_session(name: &str, repo: &str, peers: &[&str], projects: &[&str]) -> NativeFleetSession {
-        NativeFleetSession { name: name.to_owned(), windows: vec![NativeFleetWindow { name: name.to_owned(), repo: repo.to_owned(), kind: None }], sync_peers: peers.iter().map(|value| (*value).to_owned()).collect(), project_repos: projects.iter().map(|value| (*value).to_owned()).collect(), ..NativeFleetSession::default() }
+        NativeFleetSession { name: name.to_owned(), windows: vec![NativeFleetWindow { name: name.to_owned(), repo: repo.to_owned(), kind: None, kind_source: None }], sync_peers: peers.iter().map(|value| (*value).to_owned()).collect(), project_repos: projects.iter().map(|value| (*value).to_owned()).collect(), ..NativeFleetSession::default() }
     }
 
     fn soulsync_empty_fleet() -> Vec<NativeFleetSession> { Vec::new() }
